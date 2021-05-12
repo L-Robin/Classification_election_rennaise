@@ -1,0 +1,477 @@
+---
+title: "Projet Classification M1 MAS"
+author: "Arthur CONAS - Malo REYNES - Lucas ROBIN"
+date: \today
+output:
+  pdf_document:
+    toc: yes
+  html_document:
+    toc: yes
+    toc_depth: '2'
+    lang: fr
+    df_print: paged
+numbersections : true
+header-includes:
+  - \usepackage{fancyhdr}
+  - \pagestyle{fancy}
+  - \fancyhead[C]{}
+  - \fancyhead[R]{2021}
+  - \fancyhead[L]{Projet Classification}
+  - \fancyfoot[C]{}
+  - \fancyfoot[L]{Arthur CONAS, Malo REYNES, Lucas ROBIN}
+  - \fancyfoot[R]{Page \thepage}
+  - \linespread{1.25}
+  - \usepackage{amsfonts}
+  - \usepackage{setspace}
+  - \usepackage{wrapfig}
+subtitle: Classification des bureaux de vote des élections européennes 2019 
+fontsize: 10pt
+---
+\pagebreak 
+
+
+# Introduction
+
+En 2019, les électeurs rennais ont pu voter pour leurs députés européens. En tout, ils ont élu 4 députés, un pour chaque circonscription.
+A l'issue de ces élections, la métropole rennaise a recueilli toutes les données en lien avec ce suffrage et les a laissé à disposition sur leur site en open sourc (https://data.rennesmetropole.fr/explore/dataset/resultats_e19/export/). Aujourd’hui nous allons travailler sur ce jeu de données en lien avec les élections européennes de 2019.
+Nous savons grâce à notre base de données combien de votes un candidat a reçu dans un bureau de vote précis. Notre objectif va être de répondre à la question suivante : Peut-on regrouper des bureaux de vote semblables à Rennes et existe-t-il un lien géographique entre ces groupes ?
+	Pour répondre à ces questions, nous allons réaliser deux classifications vues en cours : la méthode de partitionnement autour de centres mobiles (K-means) et la classification ascendante hiérarchique (CAH). Nous choisirons le meilleur modèle de classification et étudierons les groupes pour voir si on peut faire un lien avec les coordonnées des bureaux de vote.
+
+
+```{r,warning=FALSE,echo=FALSE,message=FALSE}
+library(readr)
+library(ade4)
+library(stringr)
+library(cluster)
+library(leaflet)
+library(ggplot2)
+library(tidyverse)
+library(sf)
+library(FactoMineR)
+library(factoextra)
+library(dendextend)
+library(factoextra)
+```
+
+
+
+```{r,echo=FALSE,message=FALSE}
+resultats_e19 <- read_delim("resultats_e19.csv", 
+    ";", escape_double = FALSE, trim_ws = TRUE)
+
+# Récupération de la conolonne Geo point en deux colonnes longitude et latitude
+colnames(resultats_e19)[124] <- 'longlat'
+resultats_e19 <- separate(resultats_e19,longlat, c('long','lat'), sep =',')
+resultats_e19[c(124,125)] <-  type.convert(resultats_e19[c(124,125)])
+
+```
+
+# Prise en main du jeu de données
+
+\quad Dans notre base de données, nous avons une variable qui s’appelle **NIVEAU_DETAIL**. Elle à 4 modalités:
+
+- **vi** (1), qui représente la ville de Rennes et qui regroupe tout.
+- **ci** (4), regroupe les 4 circonscriptions de la ville (1, 2, 3 et 8).(cf. Graphique n°3)
+- **li** (28), regroupe les 28 lieux de vote de la ville (des gymnases aux établissements scolaires).
+- **bu** (107), chaque bureau de la ville (un lieu peut regrouper plusieurs bureaux de vote).
+
+D’ordinaire en classification, on essaye autant que possible de se concentrer sur l’affichage le plus fin, ici bu. C’est donc ce que nous allons faire ici, surtout que sur le site de la métropole nous pouvons obtenir la carte de tous nos bureaux au format shp avec les secteurs géographique correspondant. Nous allons donc réduire la taille de notre jeu de données pour ne travailler qu’avec les bureaux de vote.
+
+
+## Données manquantes et outliers
+
+\quad Dans notre jeu de données brut, nous n'avons presqu'aucune adresse mais cette variable ne semble pas très utile, nous allons la supprimer.
+Pour ce qui est des individus, aucun ne comporte plus de 50% de données manquantes, ainsi il n’est pas nécessaire d’en retirer selon ce critère. Les individus ayant le plus de données manquantes sont les circonscriptions où la ville par exemple car elles n’ont pas de nom de lieu (logique puisque nous sommes sur de grandes étendues géographiques). Mais comme nous ne nous intéressons qu’aux bureaux de vote, nous ne serons pas dérangés.
+
+```{r,echo=FALSE}
+resultats_e19_bis <- resultats_e19[,-8]
+```
+
+A partir d’ici nous utiliserons la table **resultats_e19_bis** qui est notre table de base modifiée.
+
+Pour ce qui est des outliers, il n’y en a pas à condition de travailler sur un niveau de détail équivalent. En effet, si on laisse la ville et qu’on la compare avec des bureaux de vote, il y a 100 fois plus de votants et donc la comparaison est difficile. Par contre si on compare des lieux entre eux, il n’y a aucun problème.
+
+Néanmoins, après une lecture approfondie de la base de données et un *summary()*, nous avons trouvé un bureau de vote pour le moins surprenant. En effet, le bureau de vote numéro **435** est particulier puisqu’il a recueilli 33% de voix pour le candidat 4 (qui en a en moyenne 0,5%) et à contrario, 0% pour le candidat 5 qui lui tourne à plus de 20% sur l’ensemble de l'agglomération. Par sécurité, nous avons décidé de retirer ce bureau de vote.
+
+```{r,echo=FALSE}
+mes_lignes_a_sup <- which(replace(resultats_e19_bis$NUMERO_LIEU == 435, is.na(resultats_e19_bis$NUMERO_LIEU == 435), TRUE))
+resultats_e19_bis <- resultats_e19_bis[-mes_lignes_a_sup, ]
+```
+
+
+## Standardiasation  
+\quad Nous avons décidé de ne pas standardiser nos données puisqu’on utilise les pourcentages de votes ainsi nous n'avons pas de problème d'unité de mesure. En effet, ce qui nous intéresse c’est de savoir si la position géographique joue sur les tendances de vote et donc la répartition des voix. Néanmoins, il ne sert à rien d’étudier les nombres de votants pour un candidat puisque tous les lieux n’ont pas le même nombre d’inscrits. On s’en tiendra donc au pourcentage des voix.
+En essayant d’être plus clair, nous voulons comparer les bureaux de vote sur un pied d’égalité et pour ce faire, les pourcentages sont parfaits puisqu’ils ne prennent pas en compte la taille des bureaux.
+
+On va quand même retirer les candidats qui n’ont eu aucune voix et ce peu importe le bureau de vote puisqu’il n’y a pas de variance (ou plutôt la variance est nulle) et donc qu’ils n’apportent rien à notre analyse.
+Les candidats supprimés sont les candidats 6, 25 et 33.  
+```{r,echo=FALSE}
+resultats_e19_bis <- resultats_e19_bis[,-c(38, 95, 119)]
+```
+
+## Choix des variables et regroupement 
+
+
+\quad Ici nous allons devoir faire un grand ménage puisque plusieurs variables sont inutiles, redondantes ou calculables. Nous allons toutes les enlever.
+
+On peut retirer beaucoup de variables :  
+
+- CODE_ELECTION, NOM_ELECTION et NUMERO_TOUR n'ont pas d'intérêt, elles possèdent toutes leurs valeurs par défaut qui est redondante.
+- NOM CIRCONSCRIPTION, NOM CANTON qui sont redondants avec le numéro (construction logique).
+- On ne va pas garder les variables NUM_CENTRE et VALID. Pour la première, elle correspond au numéro du lieu et on peut le retrouver très facilement grâce au numéro du bureau. Pour la deuxième, c’est la validation que l’élection s’est bien déroulée et ici c’est le cas partout donc cette valeur peut être prise par défaut.
+- On retire les noms des candidats puisque leurs numéros suffiront pour la suite de notre analyse. Finalement on ne s’intéresse pas vraiment aux opinions politiques des votants pour faire nos groupes mais plutôt à la façon dont ils votent et les différences selon les lieux de vote.
+- On retire aussi le nombre de voix qui est une valeur absolue et dépend trop du nombre de votants. On s’intéressera donc uniquement aux pourcentages (valeurs relatives mieux exploitables).
+- Pour finir on enlève la variable GEOM_POINT car on ne s’intéressera pas aux coordonnées géographiques. Pour placer les lieux, on utilisera la carte crée à partir des données shp (disponible ici : https://data.rennesmetropole.fr/explore/dataset/perimetres-bureaux-de-vote/information/).
+
+On choisit de garder les pourcentages car on veut distinguer les individus en fonction des orientations de votes. On enlève ainsi la taille du bureau comme critère. 
+
+```{r,echo=FALSE}
+resultats_e19_bis <- resultats_e19_bis[,-c(1, 2, 3, 4, 9, 11, 12, 13, 14, 15, 16, 17, 19, 20)]
+resultats_e19_bis <- resultats_e19_bis[, str_count(colnames(resultats_e19_bis), "CANDIDAT") != 1]
+resultats_e19_bis <- resultats_e19_bis[, str_count(colnames(resultats_e19_bis), "NB_VOIX") != 1]
+# On crée maintenant 2 tables, une avec nos bureaux de vote et une avec nos lieux de vote.
+resultats_e19_bu <- resultats_e19_bis[resultats_e19_bis$NIVEAU_DETAIL == "bu", ]
+resultats_e19_li <- resultats_e19_bis[resultats_e19_bis$NIVEAU_DETAIL == "li", ]
+
+```
+
+# Classification des individus
+## K-means  
+
+\quad Le premier algorithme utilisé est celui des K-means. L'objectif de cet algorithme est de regrouper en K groupes distincts (cluster) nos individus, qui sont ici les bureaux de votes. De cette manière, les individus se trouvant dans un même groupe doivent avoir une variance intra-groupe faible (puisque les individus se ressemblent). Pour associer des individus dans des groupes homogènes, l'algorithme utilise une notion de similarité entre individus. L'algorithme affecte au début K centroïdes distincts, et affecte un à un les individus au cluster dont il est le plus proche, puis, le centre de ce cluster est recalculé. Afin que ces clusters soient stables, nous devons effectuer plusieurs fois ce tirage, nous choisirons de le faire **50 fois**. Cependant, nous ne savons toujours pas de quel K nous parlons. En effet, nous faisons tourner l'algorithme pour K allant  de 1 à 15 afin d'en sélectionner un. La sélection du nombre  de clusters se fait selon une règle simple mais interprétable. Nous voulons que la variance intra-groupes soit  faible afin d'être certain que nos individus soient similaires, et nous ne voulons pas trop de groupes. Plus le nombres de groupes augmente, plus la variance intra-groupe diminue.
+Nous cherchons donc un juste milieu entre nombres de groupes et la part de variance. Pour ce faire nous allons regarder l’augmentation de de la variance avec la diminution du nombre de groupes et chercher un coude sur le graphe qui en découle.
+
+
+```{r,echo=FALSE} 
+d<-resultats_e19_bu[,7:37]
+K=3
+cl = kmeans(d,K,nstart=50)
+varintra = sapply(1:15,FUN=function(k){kmeans(d,k,nstart=50)$tot.withinss })
+donnee_k<-data.frame(varintra,seq(1:15))
+colnames(donnee_k)<-c('varintra','x_k')
+plotvarK<-ggplot(donnee_k)+aes(x=x_k,y=varintra)+geom_line(size=0.4)+ geom_point(color =    "darkblue",size=1)+xlab("Nombre K de cluster")+
+          ylab("Variance Intra-groupe")+
+          geom_vline(xintercept=3, linetype="dashed", color = "red",size=0.8)+
+          theme(axis.line = element_line(color = "black",size = 0.6, linetype = "solid",arrow=arrow(length = unit(0.3, "lines"))))
+ggsave("mon_graphique.png",
+  plot = plotvarK,
+  width = 2.6, height = 2.6
+)
+
+```
+
+\begin{wrapfigure}{r}{0.3\textwidth}
+  \vspace{-15pt}
+  \begin{center}
+    \includegraphics[width=0.3\textwidth]{mon_graphique.png}
+  \end{center}
+  \vspace{-30pt}
+  \vspace{-10pt}
+\end{wrapfigure}
+
+\quad Afin de sélectionner K centroïdes, nous représentons sur ce graphique en abscisse K allant de 1 à 15 et en ordonnée la variance intra groupe. Le graphique se lit de droite à gauche, en utilisant "The Elbow Method", la méthode du coude. A partir d'un certain K, si nous voulons passer à K-1 groupes, l'augmentation d'inertie devient trop importante. Ce K est représenté visuellement sur le graphique et vaut 3, il y a un coude entre la courbe allant de 3 à 15 et entre 2 et 3. Ces groupes, nous les représentons en annexe via un clusplot. Nous représenterons les caractéristiques des individus de ces 3 groupes via un barplot plus bas. 
+
+**Représentations des groupes des K-means :**  
+
+\quad Pour représenter graphiquement nos individus, il est possible d'utiliser la visualisation offerte par l'ACP. Nous utiliserons ici les groupes formés par les K-means. On constate que notre axe 1 est relativement pertinent et nous permet de bien différencier les différents groupes. À l'inverse l'axe 2 ne permet pas de différencier nos groupes.
+Néanmoins ces résultats sont à nuancer dû à la perte d'information entraînée par la projection.  
+
+```{r,echo=FALSE, fig.align = 'center',fig.width=5.5,fig.height=3}
+# ACP 
+# Individus
+K=3
+cl = kmeans(d,K,nstart=50)
+# Autre proposition de représentation 
+fviz_cluster(cl, data = resultats_e19_bu[,7:37],
+             palette = c("#2E9FDF", "#00AFBB", "#E7B800",'red'), 
+             geom = "point",
+             ellipse.type = "convex", 
+             ggtheme = theme_bw())
+```
+
+```{r,echo=FALSE,warning=FALSE}
+vi<-(resultats_e19[resultats_e19$NIVEAU_DETAIL=="vi",])
+nom<-vi[,seq(22,121,by=3)]#34
+nom<-t(nom[,-c(6,25,32)])
+res<-vi[,seq(23,122,by=3)]#34
+res<-t(res[,-c(6,25,32)]/60379*100)
+res<-cbind(res,nom)
+res<-data.frame(res)
+res$type<-"moyenne"
+colnames(res)<-c("freq","nom","type")
+res$freq<-as.numeric(as.character(res$freq))
+res<-res[order(res$freq,decreasing = T),][1:7,]
+res<-rbind(res,data.frame(type="moyenne",freq=100-sum(res$freq),nom="Autres"))
+row.names(res)<-seq(1:8)
+```
+
+
+```{r,echo=FALSE,warning=FALSE,message=FALSE}
+cluster_k<-cl$cluster
+d$cluster_k<-cluster_k
+
+cl1<-data.frame(colMeans(d[d$cluster_k==1,])[-32],nom)
+cl1$type<-"cluster_1"
+colnames(cl1)<-c("freq","nom","type")
+cl1<-cl1[order(cl1$freq,decreasing = T),][1:7,]
+cl1<-rbind(cl1,data.frame(type="cluster_1",freq=100-sum(cl1$freq),nom="Autres"))
+rownames(cl1)<-seq(1:8)
+
+cl2<-data.frame(colMeans(d[d$cluster_k==2,])[-32],nom)
+cl2$type<-"cluster_2"
+colnames(cl2)<-c("freq","nom","type")
+cl2<-cl2[order(cl2$freq,decreasing = T),][1:7,]
+cl2<-rbind(cl2,data.frame(type="cluster_2",freq=100-sum(cl2$freq),nom="Autres"))
+rownames(cl2)<-seq(1:8)
+
+cl3<-data.frame(colMeans(d[d$cluster_k==3,])[-32],nom)
+cl3$type<-"cluster_3"
+colnames(cl3)<-c("freq","nom","type")
+cl3<-cl3[order(cl3$freq,decreasing = T),][1:7,]
+cl3<-rbind(cl3,data.frame(type="cluster_3",freq=100-sum(cl3$freq),nom="Autres"))
+rownames(cl3)<-seq(1:8)
+
+res<-rbind(res,cl1,cl2,cl3)
+```
+\quad Une fois nos quatre groupes établies il peut être intéréssant de regarder ce qu'il se passses à l'intérieur. Nous avons donc régardé quels étaits la répartitions des voix à l'intérieurs des groupes. On observe logiquement de nombreuses disparités.  
+
+```{r,echo=FALSE,warning=FALSE,message=FALSE, fig.align = 'center',fig.width=7,fig.height=3}
+#p <- ggplot(data=res, aes(x=type, y=freq,fill=nom)) + geom_histogram(stat='identity',position = "dodge")
+test<-res
+test$nom<-as.factor(as.character(test$nom))
+nom<-levels(test$nom)
+levels(test$nom)<-c('8','4','5','3','7','2','6','1')
+test$nom<-as.factor(as.character(test$nom))
+t <- ggplot(data=test, aes(x=type, y=freq,fill=nom)) + geom_histogram(stat='identity',position = "dodge") +
+   scale_fill_manual(values=c("#ECDB81", "#7FFFB7","#E933FF", "#333CFF", "#3393FF","#EC2F79", "#EE7FFF","#999999"),
+                     name = "Candidats", labels = c(nom[8], nom[6], nom[4],nom[2], nom[3], nom[7],nom[5], nom[1]))+xlab("Groupes")+ylab("Fréquence")
+t  
+```
+
+## Classification Ascendante Hiérarchique (CAH)
+
+\quad La Classification Ascendante Hiérarchique (CAH) est une méthode consistant à regrouper des individus en différentes classes. L'affectation aux différents groupes créés est fait en fonction de la distance qui sépare nos individus. La fonction *dist()* nous permet de créer une matrice de distance entre tous nos individus, pour se faire elle utilise la **distance euclidienne**. Cela nous permet donc d'utiliser **la méthode de Ward** (qualifiée de stratégie optimale) consistant à affecter un groupe à un individu minimisant la distance de Ward. La formation des groupes suit une logique simple ayant pour but de minimiser l'inertie intra-classe afin d'avoir des groupes les plus compacts possibles. Le tout en essayant de maximiser l'inertie inter-classe pour obtenir les groupes les plus distincts possibles.  
+Une des particularités de la CAH est que le nombre de classes désiré n'est pas choisi au départ. Pour se donner une idée de quel nombre de groupes choisir on peut représenter l'évolution de l'inertie intra puis en fonction du résultat visualiser le dendrogramme associé.
+  
+    
+```{r,echo=FALSE, fig.align = 'center',fig.width=5,fig.height=4}
+# CAH
+dist.resultat <- dist(resultats_e19_bu[,7:37])
+CAH <- hclust(dist.resultat, method = 'ward.D')
+resultats_e19_bu$ychap<- cutree(CAH, k = 4)
+# Diagramme d'évolution de l'inertie intra 
+donnee_cah<-data.frame(rev(CAH$height)[1:15],seq(1:15))
+colnames(donnee_cah)<-c('varintra','x_k')
+plotvarcah<-ggplot(donnee_cah)+aes(x=x_k,y=varintra)+geom_line(size=0.4)+ geom_point(color =    "darkblue",size=1)+xlab("Nombre K de cluster")+
+          ylab("Inertie intra-groupe")+
+          geom_vline(xintercept=4, linetype="dashed", color = "red",size=0.8)+
+          theme(axis.line = element_line(color = "black",size = 0.6, linetype = "solid",arrow=arrow(length = unit(0.3, "lines"))))
+ggsave("cah.png",
+  plot = plotvarcah,
+  width = 2.6, height = 2.6
+)
+
+```
+
+\begin{wrapfigure}{r}{0.3\textwidth}
+  \vspace{-1pt}
+  \begin{center}
+    \includegraphics[width=0.3\textwidth]{cah.png}
+  \end{center}
+  \vspace{-30pt}
+  \vspace{-10pt}
+\end{wrapfigure}
+
+La représentation de l'inertie intra fait apparaître un "coude" lors de la création d’un 4ème groupe, celui-ci nous aide à trouver le bon compromis entre l'inertie dans chaque groupe et le nombre de groupes. Notre but étant de minimiser cette inertie pour avoir des groupes les plus distincts, on peut penser qu'il est dans un premier temps raisonnable de choisir **4 groupes**. On peut maintenant représenter le dendogramme nous montrant quels regroupements sont effetués.  
+\newline
+
+```{r,echo=FALSE, fig.align = 'center',fig.width=6,fig.height=3}
+# Dendogramme
+fviz_dend(CAH, k = 4, show_labels = FALSE, rect = TRUE)
+
+```
+
+**Représentations des groupes de la CAH :**  
+\quad De même que pour les K-means, on peut représenter la projection des individus sur 2 axes factoriels. On constate comme pour l'algorithme précédent la présence de 3 groupes distincts (2,3 et 4). Mais le groupe 1 est lui en majeur partie confondu entre le 2 et 4. Cette représentation est plutôt surprenante à notre avis, nous verrons pourquoi.
+
+```{r, echo=FALSE, fig.align = 'center',fig.width=5.5,fig.height=3}
+# Représentation des individus sur les axes de l'ACP
+acp <- princomp(resultats_e19_bu[,7:37],cor=TRUE,scores=TRUE)
+fviz_pca_ind (acp, habillage = cutree(CAH, k = 4),palette = c("#2E9FDF", "#00AFBB", "#E7B800",'red'), 
+             geom = "point",
+             addEllipses = TRUE,
+             ellipse.type = "convex", 
+             ggtheme = theme_bw(),
+             title = 'Cluster Plot')
+
+```
+\quad On représente ainsi la répartition moyenne des votes de chaque bureau. On constate que c'est Mme. LOISEAU qui l'emporte dans presque tous nos groupes. Néanmoins ce n'est pas ce qui nous intéresse, nous nous intéréssons ici à la variance des votes inter et intra groupe. L'exemple du cluster 3 est très pertinent, la candidate de La République En Marche l'emporte encore mais c'est la ou son score est le moins bon, M. Bardella réalise un score significatif dans ce cluster. En comparant avec les autres clusters, dans le cluster 3 le Rassemblement National connait une forte poularité, presque deux fois plus qu'ailleurs. Quand on compare le cluster 4 avec la moyenne de la ville, on constate que le score de M. Bellamy est significativement plus élevé.
+```{r,echo=FALSE,warning=FALSE}
+vi2<-(resultats_e19[resultats_e19$NIVEAU_DETAIL=="vi",])
+nom2<-vi2[,seq(22,121,by=3)]#34
+nom2<-t(nom2[,-c(6,25,32)])
+res2<-vi2[,seq(23,122,by=3)]#34
+res2<-t(res2[,-c(6,25,32)]/60379*100)
+res2<-cbind(res2,nom2)
+res2<-data.frame(res2)
+res2$type<-"moyenne"
+colnames(res2)<-c("freq","nom","type")
+res2$freq<-as.numeric(as.character(res2$freq))
+res2<-res2[order(res2$freq,decreasing = T),][1:7,]
+res2<-rbind(res2,data.frame(type="moyenne",freq=100-sum(res2$freq),nom="Autres"))
+row.names(res2)<-seq(1:8)
+```
+
+```{r,echo=FALSE,warning=FALSE,message=FALSE}
+d2<-resultats_e19_bu[,7:37]
+cluster_cah<-resultats_e19_bu$ychap
+d2$cluster_cah<-cluster_cah
+
+cl1b<-data.frame(colMeans(d2[d2$cluster_cah==1,])[-32],nom2)
+cl1b$type<-"cluster_1"
+colnames(cl1b)<-c("freq","nom","type")
+cl1b<-cl1b[order(cl1b$freq,decreasing = T),][1:7,]
+cl1b<-rbind(cl1b,data.frame(type="cluster_1",freq=100-sum(cl1b$freq),nom="Autres"))
+rownames(cl1b)<-seq(1:8)
+
+cl2b<-data.frame(colMeans(d2[d2$cluster_cah==2,])[-32],nom2)
+cl2b$type<-"cluster_2"
+colnames(cl2b)<-c("freq","nom","type")
+cl2b<-cl2b[order(cl2b$freq,decreasing = T),][1:7,]
+cl2b<-rbind(cl2b,data.frame(type="cluster_2",freq=100-sum(cl2b$freq),nom="Autres"))
+rownames(cl2b)<-seq(1:8)
+
+cl3b<-data.frame(colMeans(d2[d2$cluster_cah==3,])[-32],nom2)
+cl3b$type<-"cluster_3"
+colnames(cl3b)<-c("freq","nom","type")
+cl3b<-cl3b[order(cl3b$freq,decreasing = T),][1:7,]
+cl3b<-rbind(cl3b,data.frame(type="cluster_3",freq=100-sum(cl3b$freq),nom="Autres"))
+rownames(cl3b)<-seq(1:8)
+
+cl4b<-data.frame(colMeans(d2[d2$cluster_cah==4,])[-32],nom2)
+cl4b$type<-"cluster_4"
+colnames(cl4b)<-c("freq","nom","type")
+cl4b<-cl4b[order(cl4b$freq,decreasing = T),][1:7,]
+cl4b<-rbind(cl4b,data.frame(type="cluster_4",freq=100-sum(cl4b$freq),nom="Autres"))
+rownames(cl4b)<-seq(1:8)
+
+res2<-rbind(res2,cl1b,cl2b,cl3b,cl4b)
+```
+
+```{r,graph,echo=FALSE,warning=FALSE,message=FALSE, fig.align = 'center',fig.width=7,fig.height=3}
+#p <- ggplot(data=res, aes(x=type, y=freq,fill=nom)) + geom_histogram(stat='identity',position = "dodge")
+test2<-res2
+test2$nom<-as.factor(as.character(test2$nom))
+nom_g2<-levels(test2$nom)
+levels(test2$nom)<-c('8','4','5','3','7','2','6','1')
+test2$nom<-as.factor(as.character(test2$nom))
+t2 <- ggplot(data=test2, aes(x=type, y=freq,fill=nom)) + geom_histogram(stat='identity',position = "dodge") +
+   scale_fill_manual(values=c("#ECDB81", "#7FFFB7","#E933FF", "#333CFF", "#3393FF","#EC2F79", "#EE7FFF","#999999"),
+                     name = "Candidats", labels = c(nom_g2[8], nom_g2[6], nom_g2[4],nom_g2[2], nom_g2[3], nom_g2[7],nom_g2[5],nom_g2[1]))+xlab("Groupes")+ylab("Fréquence")
+t2
+```
+\pagebreak
+## Comparaison K-means / CAH 
+
+\begin{wrapfigure}{r}{0.3\textwidth}
+  \vspace{-15pt}
+  \begin{center}
+    $\begin{pmatrix}
+  cluster&1&2&3 \\
+  1^{*}&27&0&0 \\
+  2^{*}&27&2&8 \\
+  3^{*}&0&0&13 \\
+  4^{*}&3&26&0 \\
+\end{pmatrix}$
+  \end{center}
+  \vspace{-30pt}
+  \vspace{10pt}
+\end{wrapfigure}
+\quad Nous avons obtenus à partir des K-means et de la CAH* respectivement  3 et 4* clusters. Cette matrice, nous montre la correspondance entre les groupes  formés par les deux méthodes. En ligne nous avons les clusters correspondant aux clusters des CAH, et en colonne, ceux des K-means. Le premier groupe des K-means se subdivise quasi-intégralement dans les groupes 1* et 2* de la CAH et le  deuxième groupe devient en quasi totalité le 4ème. Le troisième forme en totalité le 3* et ajoute 8 \ bureaux au 2*. 
+Nous avons donc un groupe qui ne change presque pas (groupe 2) deux groupent qui se divisent en 3 (groupes 1, 2 et 3 de la CAH).
+
+
+
+  
+## Décision d’une classification finale
+\quad Maintenant que nous avons classé nos bureaux dans différents groupes grâce à deux méthodes, il va falloir choisir la meilleure d’entre elles. Nous allons choisir de favoriser la **CAH** en s’appuyant sur plusieurs arguments.
+
+Le premier élément que nous allons consulter est le graphique pour déterminer le nombre de groupes. Pour la CAH nous avons décidé de faire 4 groupes en observant une subite augmentation de l’inertie intra lorsqu’on descend à 3 groupes.
+Pour les k-means nous étudions plutôt la variance intra groupe et cette foi-ci nous conservons 3 groupes. Néanmoins le coude est bien plus marqué pour la CAH, tandis qu’avec les K-means le doute subsiste. Pour l’instant on aura donc plutôt tendance à choisir la CAH.  
+
+D'après nos connaissances dans le domaine politique, nous avons étudié la composition des groupes pour voir si elle était politiquement cohérent.
+Comme nous l’avons vu précédemment, les groupes obtenus via les K-means et la CAH peuvent être interprétés par différentes tendances politiques.
+Quand on étudie ces tendances avec la matrice des correspondances, on constate que le groupe 1 des K-means est réparti équitablement entre les groupes 1 et 2 de la CAH. En interprétant politiquement, on peut dire que dans la méthode des K-means, les groupes représentants les alliances des divers gauches et celui des écologistes sont rassemblés sous la même bannière. Ce choix n’est pas incohérent puisque historiquement ces deux partis sont assez proches mais aujourd’hui, ils se distinguent de plus en plus. On préférera les laisser chacun de leur côté puisque le parti écologie les verts monte de plus en plus et vient même dépasser les partis gauchistes par moment, nous ne pouvons plus le considérer comme un parti annexe.
+
+Un peu plus loin dans ce dossier, nous avons fait des cartes avec nos différents groupes, obtenus pour chacune de nos méthodes (cf. Graphique 1).
+La carte des CAH est plus intéréssante avec ses 4 groupes, on y retrouve plus facilement des zones géographiques "prévisibles".
+Curieusement la carte des K-means est moins cohérente, nous n’arrivons pas bien à comprendre la répartition des groupes qui semble parfois presque aléatoire.
+Cet argument ne nous permet pas de choisir la CAH mais il nous invite à favoriser cette méthode. Nous ne pouvons pas partir du résultat pour choisir la méthode de construction mais dans ce cas la carte vient confirmer nos hypothèses plus qu’elle ne force le choix.
+
+D’autre part, nos connaissances théoriques sur les algorithmes de classification nous permettent de favoriser la CAH plutôt que les K-means. Cette méthode basée sur des centres mobiles est plus sensible aux valeurs extrêmes. La taille de notre échantillon est aussi un argument, nous possédons 107 individus, il n'est donc pas contraignant d'utiliser une méthode plus "lourde" telle que la CAH qui en plus enlève le phénomène d'aléa.
+
+# Cartographie   
+Il peut être intéressant de regarder la répartition de nos groupes de bureaux sur la carte de rennaise. C'est ce qui va être pertinent à observer afin de répondre à notre problématique. Dans le meilleur des cas, nous pourrions prédire les intentions de vote des habitants en fonction de la localisation de leur bureau de vote dans le cas d’une dissociation parfaite, ce qui n’est pas le cas dans la vraie vie.
+
+
+```{r,echo=FALSE, message=FALSE, warning=FALSE, fig.width=5,fig.height=5, fig.align = 'center'}
+# Retrait du bureau aberrant dans les données sp
+coord_sp <- st_read('perimetres-bureaux-de-vote/perimetres-bureaux-de-vote.shp',quiet = TRUE)
+coord_sp <- subset(coord_sp, num_bureau != 435)
+
+# Cartographie pour la CAH 
+tab_carte <- merge(resultats_e19_bu,coord_sp, by.x ="NUMERO_LIEU", by.y = "num_bureau")
+tab_carte$ychap <- as.factor(tab_carte$ychap)
+ggplot(st_geometry(tab_carte$geometry))+geom_sf(aes(fill=tab_carte$ychap)) + scale_fill_manual(values = c('#6EDD5A','#CA59FF','#DB596B','#58A7D8')) +ggtitle("Cartographie des groupes selon l'algorithme de la CAH")+ labs(fill='Groupes')
+
+# Catdes 
+resultats_e19_bu$ychap <- as.factor(resultats_e19_bu$ychap)
+catdes(resultats_e19_bu[,c(7:37,40)], num.var = 32)
+
+```
+  
+  
+
+Précédemment, nous avons vu que selon l'algorithme de classification utilisé, le nombre de groupes variait entre  3 et 4. Ceci nous amène donc à réaliser deux cartes.  
+La première représente les 4 groupes définis par la **CAH**. D’un point de vue géographique,  celle-ci semble à nos yeux plus pertinente car elle permet une meilleure distinction des groupes que celle offerte par les K-means. La carte de la CAH révèle de très nettes tendances géographiques. Celles-ci coïncident avec les tests réalisés par la fonction *catdes()* nous indiquant quelles variables (donc ici nos candidats) caractérisent le mieux nos groupes. La première concerne le groupe **4**, celui-ci est très peu dispersé et regroupe le centre-ville ainsi qu'une partie du Nord. Cette zone violette de Rennes se caractérise par un prix de l'immobilier assez élevé, supérieur à la moyenne de la ville, de ce fait la majeure partie des personnes résidant dans ces quartiers sont qualifiables de personnes "aisées". Nous ne sommes donc pas surpris d'apprendre que la variable la plus influente sur la création du groupe est celle du candidat François-Xavier Bellamy du parti Les Républicains.  
+Le groupe **3**, à l'inverse, est plus dispersé mais il regroupe des quartiers considérés plus "modestes" avec une population hétérogène. Ce sont les personnes les plus touchées par les crises récentes et ont donc tendance à s'orienter vers les partis extrêmes à cause d’un ras le bol général (effet gillets jaunes). Les candidats qui réalisent leurs meilleurs scores dans ces bureaux de votes sont Jordan Bardella du Rassemblement National et Nathalie Arthaud de Lutte Ouvrière.  
+Les groupes **1** et **2** sont les groupes les plus importants mais sont très éclatés, ils sont ainsi difficiles à caractériser. La variable contribuant à la création du premier groupe est celle associée à Yannick Jaddot, le candidat écologiste. Quant au second groupe, il se caractérise par des votes pour des partis de gauche, comme celui du candidat Raphaël Glucksmann, à la tête d'une liste réunissant Place publique, le Parti socialiste et Nouvelle Donne.  
+Le bureau de vote de couleur blanc est celui supprimé. 
+  
+La carte issue de l’algorithme des K-means est quant à elle bien moins pertinente, les groupes ne sont pas assez dissociés et ne permettent donc pas une interprétation cohérente.(cf. Graphique n°1)
+
+
+
+# Conclusion 
+Dans ce projet nous avons utilisé deux méthodes de classification pour regrouper puis distinguer nos bureaux de vote.
+En les comparants, nous avons vu que la classification ascendante hiérarchique (CAH) est plus efficace, en témoignent les deux cartes qui montrent bien les limites des K-means.
+
+Nous avons donc décidé d’utiliser la méthode de la CAH pour former 4 groupes. En utilisant la fonction *catdes()*, nous avons regardé les différentes variations de popularité dans chacun de nos groupes. Ces candidats représentent des partis politiques (ou en tous cas des idées politiques) bien distinctes, ce qui est une bonne nouvelle en soi puisque ça prouve que nos groupes sont bien différents.
+
+Nous avons ensuite placé les groupes de la CAH dans les zones géographiques correspondantes. Là aussi, l’opération est cohérente et les lieux que nous connaissons, ceux où la tendance politique est “connue”, sont assez bien représentés par le parti politique que l’on pensait.
+
+Il aurait été intéressant d’évaluer notre classification en comparant avec la vraie carte des résultats des élections, avec les partis les mieux représentés dans chaque bureau mais ce n’est malheureusement pas pertinent. En effet, ce n’est pas parce que Villejean comporte plus de sympathisants extrémistes que le reste de Rennes, que ça fait de Lutte Ouvrière le parti qui s’impose. Il faut plutôt regarder la façon dont la répartition se fait, si les victoires sont écrasantes ou si le duel était serré.
+
+\pagebreak
+# Annexes   
+
+- Graphique n°1
+
+```{r, echo=FALSE,fig.width=5,fig.height=5, fig.align = 'center'}
+# Cartographie pour les k-means 
+tab_carte$ychapK <- as.factor(cl$cluster)
+ggplot(st_geometry(tab_carte$geometry))+geom_sf(aes(fill=tab_carte$ychapK))+ scale_fill_brewer(palette="Set2")+ggtitle("Cartographie des groupes - K-means") + labs(fill='Groupes')
+  
+```
+  
+- Graphique n°2  
+\begin{figure}
+\centerline{\includegraphics[width=0.6\textwidth]{carte_cantons.png}}
+\caption{Carte des cantons}
+\end{figure}
+\pagebreak
+- Graphique n°3  
+\begin{figure}
+\centerline{\includegraphics[width=0.6\textwidth]{circonscriptions.jpeg}}
+\caption{Carte des circonscriptions}
+\end{figure}
